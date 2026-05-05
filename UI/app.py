@@ -8,7 +8,7 @@ import streamlit as st
 # FastAPI listens on whatever uvicorn uses in Agent/main.py (default 9005).
 # Streamlit does not "listen" on that port — it calls this URL as an HTTP client.
 _FASTAPI_HOST = os.getenv("FASTAPI_HOST", "127.0.0.1")
-_FASTAPI_PORT = int(os.getenv("FASTAPI_PORT", "9005"))
+_FASTAPI_PORT = int(os.getenv("FASTAPI_PORT", "8000"))
 FASTAPI_URL = f"http://{_FASTAPI_HOST}:{_FASTAPI_PORT}/chat"
 
 st.title("🤖 My Local Chatbot")

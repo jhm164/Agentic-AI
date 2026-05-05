@@ -7,6 +7,8 @@ from fastapi import FastAPI, Depends
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from pyrate_limiter import Duration, Limiter, Rate
+from fastapi_limiter.depends import RateLimiter
 load_dotenv()
 api_key = os.getenv("GEMINI_API_KEY")
 
@@ -27,48 +29,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# async def main():
-#     client = MultiServerMCPClient(
-#         {
-#             "hotels_manipura_area": {
-#                 "transport": "sse",  # HTTP-based remote server
-#                 # Ensure you start your weather server on port 8000
-#                 "url": "http://localhost:9000/sse",
-#             }
-#         }
-#     )
-
-#     tools = await client.get_tools()
-#     print(tools)
-
-    
-#     llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=api_key)
-
-#     agent = create_agent(
-#         model=llm,
-#         tools=tools,
-#     )
-#     # model_with_tools = llm.bind_tools(tools)
-#     # agent = create_react_agent(model_with_tools)
-
-
-#     # response = await agent.ainvoke({"messages": [HumanMessage("give me hotel availability of hotel id 3")]})
-#     # print(response["messages"][-1].content)
-
-#     class ChatRequest(BaseModel):
-#         message: str
-
-#     @app.get('/chat')
-#     def chat(rqeuest:ChatRequest):
-#         response =agent.ainvoke({"messages": [HumanMessage("give me hotel availability of hotel id 3")]})
-#         return response["messages"][-1].content
-
-
-#     uvicorn.run(app, host="0.0.0.0", port=8000)
-
-# if __name__ == "__main__":
-#     asyncio.run(main())
 
 llm = ChatGoogleGenerativeAI(
     model="gemini-2.5-flash",
@@ -127,7 +87,16 @@ async def event_generator(user_input: str):
     finally:
         yield "event: done\ndata: [DONE]\n\n"
 
-@app.get('/chat')
+@app.get('/chat',
+dependencies=[Depends(RateLimiter(limiter=Limiter(Rate(2, Duration.SECOND * 5))))],
+)
+async def index():
+    return {"msg": "Hello World"}
+
+
+if __name__ == "__main__":
+    uvicorn.run("main:app", reload=True)
+
 async def chat(request:ChatRequest = Depends()):
     try:
         headers = {
@@ -142,6 +111,20 @@ async def chat(request:ChatRequest = Depends()):
         )
     except Exception as e:
         return {"Error": str(e)}
+
+
+
+
+@app.post("/login")
+def login(username: str, password: str):
+    try:
+        if username == "admin" and password == "admin":
+
+            return HTTPResponse(status_code=200, content={"access_token": "admin", "token_type": "bearer"})
+        else:
+            return HTTPResponse(status_code=401, content={"error": "Invalid credentials"})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 if __name__ == "__main__":

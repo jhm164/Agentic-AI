@@ -1,16 +1,22 @@
 from langchain_google_genai import ChatGoogleGenerativeAI
 from dotenv import load_dotenv
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage
+from typing import Annotated
 import os
+import time
 import uvicorn
-from fastapi import FastAPI, Depends
+from fastapi import FastAPI, Depends, HTTPException, Body
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pyrate_limiter import Duration, Limiter, Rate
 from fastapi_limiter.depends import RateLimiter
+from utils.auth import create_access_token, verify_token
+from fastapi.security import OAuth2PasswordBearer
 load_dotenv()
 api_key = os.getenv("GEMINI_API_KEY")
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
 origins = [
 
@@ -87,42 +93,64 @@ async def event_generator(user_input: str):
     finally:
         yield "event: done\ndata: [DONE]\n\n"
 
-@app.get('/chat',
-dependencies=[Depends(RateLimiter(limiter=Limiter(Rate(2, Duration.SECOND * 5))))],
+
+@app.api_route(
+    "/chat",
+    methods=["GET", "POST"],
+    dependencies=[Depends(RateLimiter(limiter=Limiter(Rate(2, Duration.SECOND * 5))))],
 )
-async def index():
-    return {"msg": "Hello World"}
-
-
-if __name__ == "__main__":
-    uvicorn.run("main:app", reload=True)
-
-async def chat(request:ChatRequest = Depends()):
+async def chat(
+    token: Annotated[str, Depends(oauth2_scheme)],
+    message: str | None = None,
+    request: ChatRequest | None = Body(default=None),
+):
     try:
+        print("token ----->",token , "message ----->",message, "request ----->",request)
+        payload = verify_token(token)
+        if not payload:
+            raise HTTPException(status_code=401, detail="Invalid credentials")
+        exp = payload.get("exp")
+        if exp and exp < time.time():
+            raise HTTPException(status_code=401, detail="Token expired")
+
+        user_message = message or (request.message if request else None)
+        print("user_message ----->",user_message)
+        if not user_message:
+            raise HTTPException(status_code=400, detail="`message` is required")
+
         headers = {
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
         }
         return StreamingResponse(
-            event_generator(request.message),
+            event_generator(user_message),
             media_type="text/event-stream",
             headers=headers,
         )
+    except HTTPException:
+        raise
     except Exception as e:
-        return {"Error": str(e)}
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
 
 @app.post("/login")
-def login(username: str, password: str):
+def login(req: LoginRequest):
     try:
-        if username == "admin" and password == "admin":
-
-            return HTTPResponse(status_code=200, content={"access_token": "admin", "token_type": "bearer"})
-        else:
-            return HTTPResponse(status_code=401, content={"error": "Invalid credentials"})
+        if req.username == "admin" and req.password == "admin":
+            access_token = create_access_token(username=req.username, password=req.password)
+            if not access_token:
+                raise HTTPException(status_code=500, detail="Failed to generate access token")
+            return {"access_token": access_token, "token_type": "bearer"}
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

@@ -1,9 +1,11 @@
 from langchain_google_genai import ChatGoogleGenerativeAI
 from dotenv import load_dotenv
-from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage
+from langchain_core.messages import AIMessage
+from langchain.agents import create_agent
 from typing import Annotated
 import os
 import time
+import asyncio
 import uvicorn
 from fastapi import FastAPI, Depends, HTTPException, Body
 from pydantic import BaseModel
@@ -13,11 +15,12 @@ from pyrate_limiter import Duration, Limiter, Rate
 from fastapi_limiter.depends import RateLimiter
 from utils.auth import create_access_token, verify_token
 from fastapi.security import OAuth2PasswordBearer
+from langchain.agents.middleware import PIIMiddleware
+
+
 load_dotenv()
 api_key = os.getenv("GEMINI_API_KEY")
-
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
-
 origins = [
 
     "http://localhost",
@@ -35,11 +38,22 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+pii_middleware = [
+        PIIMiddleware("email", strategy="redact", apply_to_input=True),
+        PIIMiddleware("credit_card", strategy="mask", apply_to_input=True),
+        PIIMiddleware("ip", strategy="mask", apply_to_input=True),
+        PIIMiddleware("mac_address", strategy="redact", apply_to_input=True),
+        PIIMiddleware("url", strategy="redact", apply_to_input=True),
+    ]
 
 llm = ChatGoogleGenerativeAI(
     model="gemini-2.5-flash",
     google_api_key=api_key,
-    streaming=True,
+    streaming=False,
+)
+agent = create_agent(
+    model=llm,
+    middleware=pii_middleware,
 )
 
 @app.get("/")
@@ -52,7 +66,7 @@ class ChatRequest(BaseModel):
     message: str
 
 
-def _assistant_text(message: AIMessage | AIMessageChunk) -> str:
+def _assistant_text(message: AIMessage) -> str:
     """Flatten assistant message content (Gemini may use str or block lists)."""
     c = message.content
     if not c:
@@ -83,11 +97,20 @@ def _sse_data_lines(text: str) -> str:
 
 async def event_generator(user_input: str):
     try:
-        async for chunk in llm.astream([HumanMessage(content=user_input)]):
-            if isinstance(chunk, (AIMessageChunk, AIMessage)):
-                text = _assistant_text(chunk)
-                if text:
-                    yield _sse_data_lines(text)
+        print("user_input ----->",user_input)
+        result = await agent.ainvoke(
+            {"messages": [{"role": "user", "content": user_input}]}
+        )
+        messages = result.get("messages", []) if isinstance(result, dict) else []
+        assistant_text = ""
+        for message in reversed(messages):
+            if isinstance(message, AIMessage):
+                assistant_text = _assistant_text(message)
+                break
+
+        if not assistant_text:
+            assistant_text = "I could not generate a response."
+        yield _sse_data_lines(assistant_text)
     except Exception as e:
         yield _sse_data_lines(f"[error] {e}")
     finally:
@@ -105,7 +128,6 @@ async def chat(
     request: ChatRequest | None = Body(default=None),
 ):
     try:
-        print("token ----->",token , "message ----->",message, "request ----->",request)
         payload = verify_token(token)
         if not payload:
             raise HTTPException(status_code=401, detail="Invalid credentials")
@@ -114,7 +136,6 @@ async def chat(
             raise HTTPException(status_code=401, detail="Token expired")
 
         user_message = message or (request.message if request else None)
-        print("user_message ----->",user_message)
         if not user_message:
             raise HTTPException(status_code=400, detail="`message` is required")
 
@@ -123,6 +144,7 @@ async def chat(
             "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
         }
+       
         return StreamingResponse(
             event_generator(user_message),
             media_type="text/event-stream",
@@ -156,4 +178,7 @@ def login(req: LoginRequest):
 
 
 if __name__ == "__main__":
+    if os.name == "nt":
+        # Avoid noisy Proactor socket-accept disconnect traces on Windows.
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     uvicorn.run(app, host="0.0.0.0", port=9005)

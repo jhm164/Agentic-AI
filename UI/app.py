@@ -21,6 +21,22 @@ if "approval_requested" not in st.session_state:
     st.session_state.approval_requested = False
 
 
+def post_email_approval(headers: dict[str, str]) -> tuple[bool, str, str]:
+    """POST /email-approval/approve. Returns (ok, error_detail, assistant_message)."""
+    try:
+        approve_resp = requests.post(
+            FASTAPI_EMAIL_APPROVE_URL,
+            headers=headers,
+            timeout=15,
+        )
+        if approve_resp.status_code == 200:
+            data = approve_resp.json()
+            return True, "", (data.get("assistant_message") or "").strip()
+        return False, approve_resp.text or f"HTTP {approve_resp.status_code}", ""
+    except requests.RequestException as e:
+        return False, str(e), ""
+
+
 def login():
     st.title("Login")
     username = st.text_input("Username")
@@ -60,31 +76,37 @@ def chat_interface():
         pending_resp = requests.get(FASTAPI_EMAIL_PENDING_URL, headers=headers, timeout=15)
         if pending_resp.status_code == 200:
             pending_email = pending_resp.json().get("pending")
-        elif pending_resp.status_code != 404:
-            pending_fetch_error = pending_resp.text
+        else:
+            pending_fetch_error = f"HTTP {pending_resp.status_code}: {pending_resp.text}"
     except requests.RequestException:
         pending_fetch_error = "Could not reach approval endpoint."
+
+    # Server is source of truth: if API says something is pending, show approve UI.
+    if pending_email:
+        st.session_state.approval_requested = True
 
     if pending_fetch_error:
         st.info(f"Approval status unavailable: {pending_fetch_error}")
 
-    if st.session_state.approval_requested and pending_email:
-        to_value = pending_email.get("to", "unknown") if pending_email else "unknown"
-        subject_value = pending_email.get("subject", "unknown") if pending_email else "unknown"
-        st.warning(
-            f"Pending email approval: to `{to_value}` "
-            f"(subject: `{subject_value}`)"
-        )
-        if st.button("Approve Send Email"):
-            try:
-                approve_resp = requests.post(
-                    FASTAPI_EMAIL_APPROVE_URL,
-                    headers=headers,
-                    timeout=15,
+    need_approval_ui = st.session_state.approval_requested
+
+    if need_approval_ui:
+        with st.container(border=True):
+            st.markdown("### Pending email send")
+            st.caption(
+                "The assistant paused for approval. Review the draft below, then approve."
+            )
+            if pending_email:
+                st.write(f"**To:** `{pending_email.get('to', 'unknown')}`")
+                st.write(f"**Subject:** `{pending_email.get('subject', 'unknown')}`")
+            else:
+                st.caption(
+                    "Pending details did not load from the API; you can still try approving "
+                    "if this chat turn showed **[APPROVAL REQUIRED]**."
                 )
-                if approve_resp.status_code == 200:
-                    approved_payload = approve_resp.json()
-                    resumed_message = approved_payload.get("assistant_message", "").strip()
+            if st.button("Approve Send Email", type="primary", key="approve_email_main"):
+                ok, err, resumed_message = post_email_approval(headers)
+                if ok:
                     if resumed_message:
                         st.session_state.messages.append(
                             {"role": "assistant", "content": resumed_message}
@@ -93,9 +115,7 @@ def chat_interface():
                     st.success("Email approved and resumed.")
                     st.rerun()
                 else:
-                    st.error(f"Approval failed: {approve_resp.text}")
-            except requests.RequestException as e:
-                st.error(f"Approval request failed: {e}")
+                    st.error(f"Approval failed: {err}")
 
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):

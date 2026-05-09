@@ -62,7 +62,7 @@ def _sanitize_approval_payload(payload: dict[str, str] | None) -> dict[str, str]
 
 @tool
 def send_email(to: str, subject: str, body: str) -> str:
-    """Send an email after explicit HITL approval."""
+    """Send an email after explicit HITL approval. Call this tool as soon as the user asks to send mail and you know who it is for and what to say—do not ask follow-ups in chat instead of calling. If the user omitted subject, infer a short subject from their message (e.g. topic or '(No subject)')."""
     approval = interrupt(
         {
             "action": "send_email",
@@ -89,7 +89,8 @@ def send_email(to: str, subject: str, body: str) -> str:
 
 
 pii_middleware = [
-        PIIMiddleware("email", strategy="redact", apply_to_input=True),
+        # Do not redact emails on input: the model must see real addresses to call
+        # send_email correctly; HITL approval is the safety gate instead.
         PIIMiddleware("credit_card", strategy="mask", apply_to_input=True),
         PIIMiddleware("ip", strategy="mask", apply_to_input=True),
         PIIMiddleware("mac_address", strategy="redact", apply_to_input=True),
@@ -104,9 +105,20 @@ llm = ChatGoogleGenerativeAI(
     google_api_key=api_key,
     streaming=False,
 )
+
+_AGENT_SYSTEM_PROMPT = """You are a helpful assistant.
+
+Answer normal questions using your general knowledge.
+
+When the user asks to send email / mail / message someone:
+- Call send_email immediately once you have recipient address and body text (what they want said).
+- If they did not give a subject, infer a short subject from context (e.g. first words of the topic, or "(No subject)").
+- Do not stall by asking for subject or extra details in plain text if you can reasonably infer them—the approval step lets a human review the draft."""
+
 agent = create_agent(
     model=llm,
     tools=[send_email],
+    system_prompt=_AGENT_SYSTEM_PROMPT,
     middleware=pii_middleware,
     checkpointer=InMemorySaver(),
 
@@ -153,11 +165,11 @@ def _sse_data_lines(text: str) -> str:
 
 async def event_generator(user_input: str):
     try:
-        print("user_input ----->",user_input)
         result = await agent.ainvoke(
             {"messages": [{"role": "user", "content": user_input}]},
             config={"configurable": {"thread_id": _THREAD_ID}},
         )
+        print("result ----->", result.get("__interrupt__"))
         if isinstance(result, dict) and result.get("__interrupt__"):
             global _pending_email_approval
             payload: dict[str, str] = {

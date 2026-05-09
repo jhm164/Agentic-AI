@@ -6,6 +6,7 @@ from typing import Annotated
 import os
 import time
 import asyncio
+import threading
 import uvicorn
 from fastapi import FastAPI, Depends, HTTPException, Body
 from pydantic import BaseModel
@@ -16,7 +17,9 @@ from fastapi_limiter.depends import RateLimiter
 from utils.auth import create_access_token, verify_token
 from fastapi.security import OAuth2PasswordBearer
 from langchain.agents.middleware import PIIMiddleware
-
+from langgraph.checkpoint.memory import InMemorySaver
+from langchain_core.tools import tool
+from langgraph.types import interrupt, Command
 
 load_dotenv()
 api_key = os.getenv("GEMINI_API_KEY")
@@ -38,12 +41,62 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+_approval_lock = threading.Lock()
+_pending_email_approval: dict[str, str] | None = None
+_THREAD_ID = "chat-session"
+
+
+def _email_request_id(to: str, subject: str, body: str) -> str:
+    return f"{to}|{subject}|{body}"
+
+
+def _sanitize_approval_payload(payload: dict[str, str] | None) -> dict[str, str] | None:
+    if not payload:
+        return None
+    return {
+        "id": payload["id"],
+        "to": payload["to"],
+        "subject": payload["subject"],
+    }
+
+
+@tool
+def send_email(to: str, subject: str, body: str) -> str:
+    """Send an email after explicit HITL approval."""
+    approval = interrupt(
+        {
+            "action": "send_email",
+            "id": _email_request_id(to, subject, body),
+            "to": to,
+            "subject": subject,
+            "body": body,
+            "prompt": "Approve sending this email?",
+        }
+    )
+    approved = False
+    if isinstance(approval, bool):
+        approved = approval
+    elif isinstance(approval, dict):
+        approved = bool(approval.get("approved"))
+
+    if not approved:
+        return "Email send was rejected."
+
+    return (
+        f"[MOCK] send_email approved and executed for to='{to}', "
+        f"subject='{subject}'. No real email was sent."
+    )
+
+
 pii_middleware = [
         PIIMiddleware("email", strategy="redact", apply_to_input=True),
         PIIMiddleware("credit_card", strategy="mask", apply_to_input=True),
         PIIMiddleware("ip", strategy="mask", apply_to_input=True),
         PIIMiddleware("mac_address", strategy="redact", apply_to_input=True),
         PIIMiddleware("url", strategy="redact", apply_to_input=True),
+         # Layer 4: Model-based safety check (after agent)
+        # SafetyGuardrailMiddleware(),
+         # Persist the state across interrupts
     ]
 
 llm = ChatGoogleGenerativeAI(
@@ -53,7 +106,10 @@ llm = ChatGoogleGenerativeAI(
 )
 agent = create_agent(
     model=llm,
+    tools=[send_email],
     middleware=pii_middleware,
+    checkpointer=InMemorySaver(),
+
 )
 
 @app.get("/")
@@ -99,8 +155,31 @@ async def event_generator(user_input: str):
     try:
         print("user_input ----->",user_input)
         result = await agent.ainvoke(
-            {"messages": [{"role": "user", "content": user_input}]}
+            {"messages": [{"role": "user", "content": user_input}]},
+            config={"configurable": {"thread_id": _THREAD_ID}},
         )
+        if isinstance(result, dict) and result.get("__interrupt__"):
+            global _pending_email_approval
+            payload: dict[str, str] = {
+                "id": "pending-email",
+                "to": "unknown",
+                "subject": "unknown",
+            }
+            first_interrupt = result["__interrupt__"][0]
+            value = getattr(first_interrupt, "value", None)
+            if isinstance(value, dict):
+                payload = {
+                    "id": str(value.get("id", "pending-email")),
+                    "to": str(value.get("to", "unknown")),
+                    "subject": str(value.get("subject", "unknown")),
+                }
+            with _approval_lock:
+                _pending_email_approval = payload
+            yield _sse_data_lines(
+                "[APPROVAL REQUIRED] Pending send_email request. Click 'Approve Send Email'."
+            )
+            return
+
         messages = result.get("messages", []) if isinstance(result, dict) else []
         assistant_text = ""
         for message in reversed(messages):
@@ -175,6 +254,56 @@ def login(req: LoginRequest):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/email-approval/pending")
+def get_pending_email_approval(token: Annotated[str, Depends(oauth2_scheme)]):
+    payload = verify_token(token)
+    if not payload:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    exp = payload.get("exp")
+    if exp and exp < time.time():
+        raise HTTPException(status_code=401, detail="Token expired")
+
+    with _approval_lock:
+        pending = _sanitize_approval_payload(_pending_email_approval)
+    return {"pending": pending}
+
+
+@app.post("/email-approval/approve")
+def approve_pending_email(token: Annotated[str, Depends(oauth2_scheme)]):
+    payload = verify_token(token)
+    if not payload:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    exp = payload.get("exp")
+    if exp and exp < time.time():
+        raise HTTPException(status_code=401, detail="Token expired")
+
+    with _approval_lock:
+        global _pending_email_approval
+        if not _pending_email_approval:
+            raise HTTPException(status_code=404, detail="No pending email approval")
+        approved = _sanitize_approval_payload(_pending_email_approval)
+        _pending_email_approval = None
+
+    try:
+        result = agent.invoke(
+            Command(resume={"approved": True}),
+            config={"configurable": {"thread_id": _THREAD_ID}},
+        )
+        messages = result.get("messages", []) if isinstance(result, dict) else []
+        assistant_text = ""
+        for message in reversed(messages):
+            if isinstance(message, AIMessage):
+                assistant_text = _assistant_text(message)
+                break
+        return {
+            "status": "approved",
+            "approved": approved,
+            "assistant_message": assistant_text or "Approval recorded.",
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Approval resume failed: {e}")
 
 
 if __name__ == "__main__":
